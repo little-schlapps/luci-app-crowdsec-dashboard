@@ -1,0 +1,15 @@
+{
+	"luci-app-crowdsec-dashboard": {
+		"description": "Grant access to the CrowdSec dashboard",
+		"read": {
+			"ubus": {
+				"luci.crowdsec": [ "status", "metrics", "alerts", "decisions", "lookup", "capi_check", "blocked_log" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"luci.crowdsec": [ "unblock", "ban" ]
+			}
+		}
+	}
+}

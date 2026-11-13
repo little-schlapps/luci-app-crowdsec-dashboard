@@ -1,0 +1,243 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// rpcd ucode backend for luci-app-crowdsec-dashboard.
+// Wraps read-only cscli/nft queries plus unblock and manual ban.
+// Runs inside rpcd on demand; no extra daemon.
+
+'use strict';
+
+import { popen, stat } from 'fs';
+import { connect } from 'ubus';
+
+const CSCLI = '/usr/bin/cscli';
+const BAN_DURATIONS = [ '1h', '4h', '24h', '168h' ];
+
+function run(cmd) {
+	const p = popen(cmd, 'r');
+	if (!p)
+		return '';
+	const out = p.read('all') ?? '';
+	p.close();
+	return out;
+}
+
+function jrun(cmd) {
+	const out = run(cmd);
+	try { return json(out); } catch (e) { return null; }
+}
+
+function clamp(v, lo, hi, dflt) {
+	v = int(v ?? dflt);
+	if (v != v)
+		v = dflt;
+	return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// IPv4/IPv6 address, optionally with a prefix length; nothing else reaches the shell.
+function valid_ip(ip) {
+	return type(ip) == 'string' && length(ip) > 1 && length(ip) <= 64 &&
+		match(ip, /^[0-9A-Fa-f:.]+(\/[0-9]{1,3})?$/) != null;
+}
+
+function running(name) {
+	const conn = connect();
+	const svc = conn?.call('service', 'list', { name: name });
+	conn?.disconnect();
+
+	for (let n, inst in svc?.[name]?.instances ?? {})
+		if (inst?.running)
+			return true;
+
+	return false;
+}
+
+function counters() {
+	const out = {};
+
+	for (let t in [ 'ip crowdsec', 'ip6 crowdsec6' ]) {
+		const j = jrun(`nft -j list counters table ${t} 2>/dev/null`);
+		for (let e in j?.nftables ?? [])
+			if (e?.counter)
+				out[`${e.counter.family}:${e.counter.name}`] = { packets: e.counter.packets, bytes: e.counter.bytes };
+	}
+
+	return out;
+}
+
+// Flatten "alert with decisions" objects into one row per decision.
+// cscli's --ip filter selects whole alerts: for a community-blocklist hit that
+// is one alert carrying every CAPI decision (~15k, ~3 MB), far beyond what one
+// ubus reply can carry. So keep only rows for the queried value, and cap the rest.
+const MAX_ROWS = 500;
+
+function flatten(alerts, only) {
+	const rows = [];
+
+	for (let a in alerts ?? [])
+		for (let d in a?.decisions ?? []) {
+			if (only && d.value != only && d.value != `${only}/32` && d.value != `${only}/128`)
+				continue;
+
+			if (length(rows) >= MAX_ROWS)
+				return rows;
+
+			push(rows, {
+				id: d.id, value: d.value, scope: d.scope, type: d.type,
+				origin: d.origin, scenario: d.scenario ?? a.scenario,
+				duration: d.duration, until: d.until,
+				country: a?.source?.cn, as_name: a?.source?.as_name
+			});
+		}
+
+	return rows;
+}
+
+const methods = {
+	status: {
+		call: function() {
+			const m = jrun(`${CSCLI} metrics -o json 2>/dev/null`) ?? {};
+			const decisions = [];
+			let total = 0;
+
+			for (let reason, origins in m.decisions ?? {})
+				for (let origin, actions in origins ?? {})
+					for (let action, count in actions ?? {}) {
+						push(decisions, { reason: reason, origin: origin, action: action, count: count });
+						total += count;
+					}
+
+			const bouncers = [];
+			for (let b in jrun(`${CSCLI} bouncers list -o json 2>/dev/null`) ?? [])
+				push(bouncers, {
+					name: b.name, type: b.type, ip: b.ip_address, revoked: b.revoked,
+					version: b.version, last_pull: b.last_pull
+				});
+
+			return {
+				engine: running('crowdsec'),
+				bouncer: running('crowdsec-firewall-bouncer'),
+				version: trim(run(`${CSCLI} version 2>&1 | sed -n 's/^version: *//p' | head -n1`)),
+				capi_credentials: stat('/etc/crowdsec/online_api_credentials.yaml') != null,
+				decisions_total: total,
+				decisions: sort(decisions, (a, b) => b.count - a.count),
+				bouncers: bouncers,
+				counters: counters()
+			};
+		}
+	},
+
+	metrics: {
+		call: function() {
+			const m = jrun(`${CSCLI} metrics -o json 2>/dev/null`) ?? {};
+			const cols = jrun(`${CSCLI} collections list -o json 2>/dev/null`) ?? {};
+			const collections = [];
+
+			for (let c in cols.collections ?? [])
+				push(collections, { name: c.name, status: c.status, version: c.local_version });
+
+			return {
+				acquisition: m.acquisition ?? {},
+				parsers: m.parsers ?? {},
+				scenarios: m.scenarios ?? {},
+				whitelists: m.whitelists ?? {},
+				collections: collections
+			};
+		}
+	},
+
+	alerts: {
+		args: { limit: 50 },
+		call: function(req) {
+			const limit = clamp(req.args?.limit, 1, 500, 50);
+			const rows = [];
+
+			for (let a in jrun(`${CSCLI} alerts list -o json --limit ${limit} 2>/dev/null`) ?? [])
+				push(rows, {
+					id: a.id, created_at: a.created_at, scenario: a.scenario, message: a.message,
+					events: a.events_count, ip: a?.source?.ip ?? a?.source?.value,
+					scope: a?.source?.scope, country: a?.source?.cn, as_name: a?.source?.as_name,
+					decisions: length(a?.decisions ?? []),
+					decision: a?.decisions?.[0] ? `${a.decisions[0].type} ${a.decisions[0].duration ?? ''}` : null
+				});
+
+			return { alerts: rows };
+		}
+	},
+
+	decisions: {
+		call: function() {
+			return { decisions: flatten(jrun(`${CSCLI} decisions list -o json 2>/dev/null`)) };
+		}
+	},
+
+	lookup: {
+		args: { ip: '' },
+		call: function(req) {
+			const ip = req.args?.ip;
+			if (!valid_ip(ip))
+				return { error: 'invalid address' };
+
+			return { ip: ip, decisions: flatten(jrun(`${CSCLI} decisions list -a --ip '${ip}' -o json 2>/dev/null`), ip) };
+		}
+	},
+
+	unblock: {
+		args: { ip: '' },
+		call: function(req) {
+			const ip = req.args?.ip;
+			if (!valid_ip(ip))
+				return { result: false, error: 'invalid address' };
+
+			return { result: true, output: trim(run(`${CSCLI} decisions delete --ip '${ip}' 2>&1 | tail -n1`)) };
+		}
+	},
+
+	ban: {
+		args: { ip: '', duration: '4h' },
+		call: function(req) {
+			const ip = req.args?.ip;
+			const duration = req.args?.duration;
+			if (!valid_ip(ip))
+				return { result: false, error: 'invalid address' };
+			if (!(duration in BAN_DURATIONS))
+				return { result: false, error: 'invalid duration' };
+
+			return { result: true, output: trim(run(`${CSCLI} decisions add --ip '${ip}' --duration '${duration}' --reason 'manual (LuCI)' 2>&1 | tail -n1`)) };
+		}
+	},
+
+	capi_check: {
+		call: function() {
+			const out = run(`${CSCLI} capi status 2>&1`);
+			return { ok: index(out, 'successfully interact') >= 0, output: trim(substr(out, -300)) };
+		}
+	},
+
+	blocked_log: {
+		args: { lines: 200 },
+		call: function(req) {
+			const lines = clamp(req.args?.lines, 10, 2000, 200);
+			const recent = [], by_src = {};
+
+			for (let l in split(run(`logread 2>/dev/null | grep 'crowdsec: ' | tail -n ${lines}`), '\n')) {
+				if (!length(l))
+					continue;
+
+				const get = (k) => match(l, regexp(`${k}=([^ ]+)`))?.[1];
+				const src = get('SRC');
+				const e = { time: substr(l, 0, 24), in: get('IN'), src: src, dst: get('DST'), proto: get('PROTO'), dpt: get('DPT') };
+				push(recent, e);
+				if (src)
+					by_src[src] = (by_src[src] ?? 0) + 1;
+			}
+
+			const top = [];
+			for (let ip in slice(sort(keys(by_src), (a, b) => by_src[b] - by_src[a]), 0, 25))
+				push(top, { ip: ip, count: by_src[ip] });
+
+			return { recent: reverse(slice(recent, -100)), top: top, total: length(recent) };
+		}
+	}
+};
+
+return { 'luci.crowdsec': methods };
